@@ -2,7 +2,7 @@
 
 A workflow and approval engine built with FastAPI and PostgreSQL. A request (say, a purchase order) moves through an ordered set of approval steps. Each step is assigned to an approver group and has a deadline. Every state change is written to an audit trail, and a background worker escalates steps that miss their deadline.
 
-> **Status:** in progress. The service skeleton, database schema, authentication and approver-group management are done. Workflows and the approval endpoints are being built next.
+> **Status:** in progress. Done so far: the database schema, authentication, approver groups, workflow definitions and request submission. Approving and rejecting requests are being built next.
 
 ## Tech stack
 
@@ -74,6 +74,14 @@ Then open http://localhost:8000/docs, click **Authorize**, and log in with that 
 | POST | `/groups` | Create a group (admin) |
 | PUT | `/groups/{id}/members/{user_id}` | Add a user to a group (admin). Adding an existing member is not an error |
 | DELETE | `/groups/{id}/members/{user_id}` | Remove a user from a group (admin) |
+| GET | `/workflows` | List active workflows (admins can add `?include_inactive=true`) |
+| GET | `/workflows/{id}` | A workflow and its steps |
+| POST | `/workflows` | Create a workflow with its ordered steps (admin) |
+| PATCH | `/workflows/{id}` | Rename, edit the description, or deactivate (admin) |
+| PUT | `/workflows/{id}/steps` | Replace all steps (admin). Requests already submitted are unaffected |
+| POST | `/requests` | Submit a request. Its first step starts immediately with its deadline |
+| GET | `/requests/{id}` | A request and its steps. Visible to the requester, admins, and approvers on it |
+| GET | `/requests/{id}/history` | The request's audit trail |
 
 ## Data model
 
@@ -117,5 +125,10 @@ The dev file is constrained by `-c requirements.txt`, so packages shared by both
 - **Password hashes upgrade themselves.** On login, a hash made with older Argon2 settings is replaced with one using the current settings.
 - **Duplicate emails are caught by the database's unique constraint,** not by checking first. A "check, then insert" approach can let two simultaneous registrations for the same email both through.
 - **The dev JWT secret refuses to run in production.** If `APP_ENV` isn't `development` and `JWT_SECRET` still has the placeholder value published in this repo, the app won't start.
+
+- **The service layer doesn't know about HTTP.** Services raise domain errors (`NotFound`, `Conflict`, `InvalidInput`), and one exception handler turns them into status codes. The same logic can be called from routes, the CLI and the background worker.
+- **404 instead of 403 for requests you can't see.** Someone outside a request can't tell whether its id exists.
+- **Workflows are deactivated, not deleted.** Past requests still point to them, and the audit trail should never lose what a request was submitted against.
+- **Server-generated columns come back in the INSERT itself** (`eager_defaults`). With async SQLAlchemy, reading an unloaded `created_at` would need a hidden extra query, which async code can't run implicitly.
 
 More decisions (pagination, the job queue) will be added as those parts are built.
