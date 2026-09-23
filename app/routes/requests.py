@@ -1,19 +1,62 @@
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Query
+from fastapi import status as http_status
 
 from app.deps import CurrentUser, SessionDep
-from app.schemas.requests import AuditEventOut, DecisionIn, RejectIn, RequestCreate, RequestOut
+from app.models import RequestStatus
+from app.schemas.requests import (
+    AuditEventOut,
+    DecisionIn,
+    RejectIn,
+    RequestCreate,
+    RequestOut,
+    RequestPage,
+    RequestSummary,
+)
 from app.services import decisions, requests
 
 router = APIRouter(prefix="/requests", tags=["requests"])
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=http_status.HTTP_201_CREATED)
 async def submit_request(body: RequestCreate, user: CurrentUser, session: SessionDep) -> RequestOut:
     request = await requests.submit_request(session, body, user)
     await session.commit()
     return RequestOut.model_validate(request)
+
+
+@router.get("")
+async def list_requests(
+    user: CurrentUser,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: str | None = None,
+    status: RequestStatus | None = None,
+    workflow_id: uuid.UUID | None = None,
+    mine: bool = False,
+    assigned_to_me: bool = False,
+) -> RequestPage:
+    """Requests visible to you, newest first.
+
+    - `mine=true`: only requests you submitted.
+    - `assigned_to_me=true`: requests waiting on a decision you're allowed to make.
+    - Pass the previous response's `next_cursor` as `cursor` for the next page.
+    """
+    items, next_cursor = await requests.list_requests(
+        session,
+        user,
+        limit=limit,
+        cursor=cursor,
+        status=status,
+        workflow_id=workflow_id,
+        mine=mine,
+        assigned_to_me=assigned_to_me,
+    )
+    return RequestPage(
+        items=[RequestSummary.from_request(r) for r in items], next_cursor=next_cursor
+    )
 
 
 @router.get("/{request_id}")

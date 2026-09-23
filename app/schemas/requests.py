@@ -95,3 +95,40 @@ class RejectIn(DecisionIn):
         if not value:
             raise ValueError("must not be blank")
         return value
+
+
+class RequestSummary(BaseModel):
+    """A request as shown in a list: no step history, just where it stands."""
+
+    id: uuid.UUID
+    workflow_id: uuid.UUID
+    requester_id: uuid.UUID
+    title: str
+    status: RequestStatus
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    current_step: RequestStepOut | None  # None once the request is finished
+
+    @classmethod
+    def from_request(cls, request: Any) -> "RequestSummary":
+        active = next((s for s in request.steps if s.status == StepStatus.ACTIVE), None)
+        return cls(
+            id=request.id,
+            workflow_id=request.workflow_id,
+            requester_id=request.requester_id,
+            title=request.title,
+            status=request.status,
+            version=request.version,
+            created_at=request.created_at,
+            updated_at=request.updated_at,
+            completed_at=request.completed_at,
+            current_step=RequestStepOut.model_validate(active) if active else None,
+        )
+
+
+class RequestPage(BaseModel):
+    items: list[RequestSummary]
+    # Pass as ?cursor= to get the next page. None means this is the last page.
+    next_cursor: str | None
