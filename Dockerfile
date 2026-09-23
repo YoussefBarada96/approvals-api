@@ -11,6 +11,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
+COPY alembic.ini ./
+COPY migrations ./migrations
 COPY app ./app
 
 # Don't run as root inside the container.
