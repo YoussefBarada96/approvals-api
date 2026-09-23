@@ -36,6 +36,9 @@ class StepStatus(StrEnum):
 
 class ApprovalRequest(UUIDPrimaryKey, CreatedAt, Base):
     __tablename__ = "approval_requests"
+    # Serves the listing's "ORDER BY created_at DESC, id DESC" and its keyset
+    # condition (Postgres scans the index backwards for DESC).
+    __table_args__ = (Index("ix_approval_requests_created_at_id", "created_at", "id"),)
 
     workflow_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workflows.id"), index=True)
     requester_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
