@@ -2,7 +2,7 @@
 
 A workflow and approval engine built with FastAPI and PostgreSQL. A request (say, a purchase order) moves through an ordered set of approval steps. Each step is assigned to an approver group and has a deadline. Every state change is written to an audit trail, and a background worker escalates steps that miss their deadline.
 
-> **Status:** in progress. The core approval flow works end to end: submit, approve, reject and withdraw, with an audit trail. Next up: paginated listings and the SLA escalation worker.
+> **Status:** in progress. The core approval flow works end to end: submit, approve, reject and withdraw, with an audit trail. Requests can be listed with filters and cursor pagination. Next up: the SLA escalation worker.
 
 ## Tech stack
 
@@ -79,6 +79,7 @@ Then open http://localhost:8000/docs, click **Authorize**, and log in with that 
 | POST | `/workflows` | Create a workflow with its ordered steps (admin) |
 | PATCH | `/workflows/{id}` | Rename, edit the description, or deactivate (admin) |
 | PUT | `/workflows/{id}/steps` | Replace all steps (admin). Requests already submitted are unaffected |
+| GET | `/requests` | Requests you can see, newest first. Filters: `status`, `workflow_id`, `mine`, `assigned_to_me`. Cursor-paginated |
 | POST | `/requests` | Submit a request. Its first step starts immediately with its deadline |
 | GET | `/requests/{id}` | A request and its steps. Visible to the requester, admins, and approvers on it |
 | GET | `/requests/{id}/history` | The request's audit trail |
@@ -87,6 +88,19 @@ Then open http://localhost:8000/docs, click **Authorize**, and log in with that 
 | POST | `/requests/{id}/withdraw` | The requester cancels their own pending request |
 
 Every decision body includes the `version` of the request the client last loaded, e.g. `{"version": 3, "comment": "OK"}`. If the request has changed since, the API returns `409` and nothing is applied.
+
+### Listing and pagination
+
+`GET /requests?assigned_to_me=true&limit=20` returns:
+
+```json
+{
+  "items": [{ "id": "…", "title": "New laptop", "status": "pending", "current_step": { "name": "Manager review", "due_at": "…" } }],
+  "next_cursor": "eyJjIjogIjIwMjYtMDktMjNUMTQ6MDU6MDkuMTIzNDU2KzAwOjAwIiwgImkiOiAi…"
+}
+```
+
+Pass `next_cursor` back as `?cursor=` for the next page. It's `null` on the last page.
 
 ## Request lifecycle
 
@@ -162,4 +176,8 @@ The dev file is constrained by `-c requirements.txt`, so packages shared by both
 - **Every decision rewrites the request row, even when only a step changed.** Otherwise approving a middle step wouldn't touch `approval_requests`, the version wouldn't change, and the lock above would never trigger.
 - **One transaction per decision.** The step change, the request's status and the audit event are committed together. The race test checks that the losing approval leaves no audit event behind.
 
-More decisions (pagination, the job queue) will be added as those parts are built.
+- **Cursor pagination, not `OFFSET`.** Each cursor encodes the `(created_at, id)` of the last row on the page, and the next page continues with `WHERE (created_at, id) < (…)`. Every page is an index range scan, however deep you go. Rows inserted while someone is paging can't push an item onto two pages, and a test checks this. The tradeoff is no "jump to page 7", which a work queue doesn't need. `id` breaks ties between rows created at the same instant.
+- **"Assigned to me" uses the same rules as approving.** The filter excludes your own requests and ones where you already approved an earlier step, so the list only shows requests where you'll actually be allowed to decide.
+- **Visibility is enforced in SQL for lists.** The same rule as viewing a single request is written as `EXISTS` subqueries, so filtering and pagination happen in the database, not by filtering results in Python.
+
+More decisions (the job queue) will be added as it's built.
