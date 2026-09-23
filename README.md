@@ -2,7 +2,7 @@
 
 A workflow and approval engine built with FastAPI and PostgreSQL. A request (say, a purchase order) moves through an ordered set of approval steps. Each step is assigned to an approver group and has a deadline. Every state change is written to an audit trail, and a background worker escalates steps that miss their deadline.
 
-> **Status:** in progress. The core approval flow works end to end: submit, approve, reject and withdraw, with an audit trail. Requests can be listed with filters and cursor pagination. Next up: the SLA escalation worker.
+> **Status:** in progress. The core approval flow works end to end: submit, approve, reject and withdraw, with an audit trail. Requests can be listed with filters and cursor pagination, and a background worker escalates steps that miss their deadline.
 
 ## Tech stack
 
@@ -25,7 +25,7 @@ A workflow and approval engine built with FastAPI and PostgreSQL. A request (say
 docker compose up --build
 ```
 
-Compose starts Postgres, applies migrations with a one-shot `migrate` service, then starts the API. The API runs at http://localhost:8000. Interactive docs are at http://localhost:8000/docs.
+Compose starts Postgres, applies migrations with a one-shot `migrate` service, then starts the API and the SLA worker. The API runs at http://localhost:8000. Interactive docs are at http://localhost:8000/docs.
 
 ### Locally
 
@@ -101,6 +101,12 @@ Every decision body includes the `version` of the request the client last loaded
 ```
 
 Pass `next_cursor` back as `?cursor=` for the next page. It's `null` on the last page.
+
+## SLA escalation worker
+
+`python -m app.worker` (the `worker` service in Compose) checks for overdue steps every `WORKER_POLL_SECONDS`. A step is overdue when it's active and past its `due_at`. For each one, the worker sets `escalated_at` and adds an `escalated` event to the request's history, with how long it was overdue. The worker is the "actor", so `actor_id` is `null`. Sending emails or chat messages is out of scope; the audit event is where a notifier would hook in.
+
+It's safe to run several copies (`docker compose up --scale worker=3`). On `SIGTERM` it finishes the current batch and exits.
 
 ## Request lifecycle
 
@@ -180,4 +186,8 @@ The dev file is constrained by `-c requirements.txt`, so packages shared by both
 - **"Assigned to me" uses the same rules as approving.** The filter excludes your own requests and ones where you already approved an earlier step, so the list only shows requests where you'll actually be allowed to decide.
 - **Visibility is enforced in SQL for lists.** The same rule as viewing a single request is written as `EXISTS` subqueries, so filtering and pagination happen in the database, not by filtering results in Python.
 
-More decisions (the job queue) will be added as it's built.
+- **Postgres is the job queue.** The worker claims overdue steps with `SELECT … FOR UPDATE SKIP LOCKED`. Parallel workers each skip rows another worker has locked, so there's no double escalation and no waiting on each other. A test holds one worker's lock open and checks that a second worker takes the other row straight away. Redis with Celery or RQ would add a second system to run and keep in step with the database, which this load doesn't justify.
+- **Exactly-once escalation without a separate job table.** Setting `escalated_at` and writing the audit event happen in one transaction, and the worker only claims steps where `escalated_at IS NULL`. If a worker crashes mid-batch, the transaction rolls back and another worker picks the rows up. When real notifications are added they'd go through an outbox table, since an email can't be rolled back.
+- **The partial index needs a literal.** The overdue query inlines `status = 'active'` instead of sending it as a bound parameter. Postgres only uses the partial index `WHERE status = 'active' AND escalated_at IS NULL` when it can see the literal value while planning the query.
+- **Escalation doesn't change the request's version.** It only flags the step, so an approver who is mid-decision doesn't get a 409 because the worker happened to run.
+- **The backlog drains without waiting.** When a batch comes back full, the worker goes again immediately and only sleeps once it's caught up. A failing batch is logged and retried on the next tick rather than crashing the process.
