@@ -76,3 +76,22 @@ class AuditEventOut(BaseModel):
     comment: str | None
     data: dict[str, Any]
     created_at: datetime
+
+
+class DecisionIn(BaseModel):
+    # The version of the request the user was looking at when they decided.
+    version: int = Field(ge=1)
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class RejectIn(DecisionIn):
+    # A rejection must say why.
+    comment: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("comment")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value

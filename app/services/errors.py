@@ -14,6 +14,10 @@ class DomainError(Exception):
         self.detail = detail
 
 
+class Forbidden(DomainError):
+    status_code = 403
+
+
 class NotFound(DomainError):
     status_code = 404
 

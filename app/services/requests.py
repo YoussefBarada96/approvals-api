@@ -42,7 +42,7 @@ async def submit_request(
         )
         for step in workflow.steps
     ]
-    _activate(steps[0], now)
+    activate_step(steps[0], now)
 
     request = ApprovalRequest(
         workflow_id=workflow.id,
@@ -66,7 +66,7 @@ async def submit_request(
     return request
 
 
-def _activate(step: RequestStep, now: datetime) -> None:
+def activate_step(step: RequestStep, now: datetime) -> None:
     step.status = StepStatus.ACTIVE
     step.activated_at = now
     step.due_at = now + timedelta(hours=step.sla_hours)
