@@ -1,112 +1,79 @@
 # Approvals API
 
-A workflow and approval engine built with FastAPI and PostgreSQL. A request (say, a purchase order) moves through an ordered set of approval steps. Each step is assigned to an approver group and has a deadline. Every state change is written to an audit trail, and a background worker escalates steps that miss their deadline.
+A workflow and approval engine: a FastAPI service backed by PostgreSQL, with a background worker.
 
-> **Status:** in progress. The core approval flow works end to end: submit, approve, reject and withdraw, with an audit trail. Requests can be listed with filters and cursor pagination, and a background worker escalates steps that miss their deadline.
+A request, say a purchase order, moves through an ordered series of approval steps. Each step belongs to a group of approvers ("Managers", then "Finance") and has a deadline. Every decision is recorded in an audit trail that can only be added to. A background worker escalates steps that miss their deadline.
 
-## Tech stack
+The domain is simple on purpose. The interesting part is getting the unglamorous things right: concurrent decisions, who is allowed to do what, a trustworthy history, and background work that is safe to scale out.
 
-| Area | Choice |
-| --- | --- |
-| API | FastAPI (Python 3.12) |
-| Database | PostgreSQL 16, SQLAlchemy 2.0 (async) with asyncpg, Alembic migrations |
-| Auth | OAuth2 password flow issuing JWTs (PyJWT), Argon2 password hashing (pwdlib) |
-| Config | pydantic-settings (environment variables) |
-| Dependencies | pip-tools (`requirements.in` compiled to pinned `requirements.txt`) |
-| Tests / lint | pytest, ruff |
-| Runtime | Docker, Docker Compose |
-| CI | GitHub Actions |
+## Highlights
 
-## Running it
+- **Two approvers can't both win a race.** Optimistic locking is checked twice: against the version the client saw, and again in the database's `UPDATE`. A test runs two real database sessions against each other to prove the loser gets a 409 and leaves nothing behind.
+- **Postgres doubles as the job queue.** The SLA worker claims overdue steps with `SELECT … FOR UPDATE SKIP LOCKED`, so any number of workers can run side by side without escalating the same step twice. No Redis or Celery.
+- **The audit trail can't be rewritten.** A database trigger rejects `UPDATE` and `DELETE` on the audit table, so even a bug in the application can't change history.
+- **Separation of duties.** You can't approve your own request, one person can't approve two steps of the same request, and being an admin doesn't make you an approver.
+- **Cursor pagination.** Lists page by `(created_at, id)` instead of `OFFSET`, so pages stay fast and consistent while new requests arrive.
+- **Tested against real Postgres.** The locking, triggers, `SKIP LOCKED` behaviour and migrations are exercised against an actual database, not mocks. CI also runs `alembic check` to catch models that have drifted from their migrations.
 
-### With Docker (recommended)
+## Quick start
+
+You need Docker.
 
 ```bash
 docker compose up --build
+docker compose run --rm api python -m app.cli seed-demo
 ```
 
-Compose starts Postgres, applies migrations with a one-shot `migrate` service, then starts the API and the SLA worker. The API runs at http://localhost:8000. Interactive docs are at http://localhost:8000/docs.
+The first command starts Postgres, runs migrations, then starts the API and the worker. The second loads demo data: a two-step "Purchase order" workflow and four users. Every demo user's password is `demo-password-123`.
 
-### Locally
+| User | Role |
+| --- | --- |
+| `alice@example.com` | Submits requests |
+| `mo@example.com` | Approver in **Managers** (step 1, 24h deadline) |
+| `fay@example.com` | Approver in **Finance** (step 2, 48h deadline) |
+| `admin@example.com` | Admin: manages groups and workflows |
 
-This needs Python 3.12 and a PostgreSQL server you can reach.
+Then open **http://localhost:8000/docs** and walk through it:
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-source .venv/bin/activate       # macOS / Linux
-pip install pip-tools
-pip-sync requirements.txt requirements-dev.txt
-cp .env.example .env            # then point DATABASE_URL at your database
-alembic upgrade head
-uvicorn app.main:app --reload
+1. Click **Authorize** and log in as `alice@example.com`. Call `GET /workflows` to get the workflow id, then `POST /requests` with `{"workflow_id": "…", "title": "New laptop", "details": {"amount": 1800}}`.
+2. Log in as `mo@example.com`. `GET /requests?assigned_to_me=true` shows the request. Approve it with `POST /requests/{id}/approve` and `{"version": 1}`.
+3. Log back in as `alice@example.com` and try `POST /requests/{id}/withdraw` with `{"version": 1}`. You get a `409`, because Mo's approval moved the request to version 2. A decision based on an out-of-date view is never applied.
+4. Log in as `fay@example.com` and approve with `{"version": 2}`. The request is now `approved`.
+5. `GET /requests/{id}/history` shows every step, who did it, and when.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client([Client / Swagger UI]) -- HTTPS + JWT --> api
+    subgraph compose [Docker Compose]
+        api[API<br/>FastAPI + Uvicorn]
+        worker[SLA worker<br/>python -m app.worker]
+        migrate[migrate<br/>one-shot: alembic upgrade head]
+        db[(PostgreSQL 16)]
+    end
+    api -- SQLAlchemy async --> db
+    worker -- "FOR UPDATE SKIP LOCKED" --> db
+    migrate --> db
 ```
 
-### Tests and lint
+The API and the worker share the same service layer. The API and the worker can each run as several copies. Migrations run once, before either starts.
 
-```bash
-pytest
-ruff check . && ruff format --check .
 ```
-
-The database tests (migrations, constraints) run against a separate `approvals_test` database, which Compose creates on first start, so `docker compose up db` is enough to run them. Without a reachable database they're skipped locally. CI sets `REQUIRE_DATABASE=1`, so there they fail instead.
-
-### Creating the first admin
-
-Self-registration always creates a regular user, so the first admin is created from the command line:
-
-```bash
-docker compose run --rm api python -m app.cli create-admin --email admin@example.com --name "Ada Admin"
+app/
+  main.py          FastAPI app, routers, domain-error handler
+  routes/          HTTP layer: parse input, call a service, shape output
+  services/        Business logic; raises domain errors, knows nothing about HTTP
+    decisions.py     approve / reject / withdraw state machine
+    escalations.py   SLA escalation (SKIP LOCKED)
+    requests.py      submit, visibility rules, listing
+  models/          SQLAlchemy models
+  schemas/         Pydantic request/response models
+  worker.py        Escalation worker process
+  cli.py           create-admin, seed-demo
+migrations/        Alembic migrations (0001 schema, 0002 listing index)
+tests/             pytest: unit tests plus API and service tests against Postgres
 ```
-
-Then open http://localhost:8000/docs, click **Authorize**, and log in with that email and password.
-
-## Endpoints so far
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/health` | Liveness: the process is running. Doesn't touch the database |
-| GET | `/health/ready` | Readiness: the database answers. Returns 503 if it doesn't |
-| POST | `/auth/register` | Create an account (always a regular user) |
-| POST | `/auth/token` | Log in with email and password (OAuth2 form) and get a bearer token |
-| GET | `/users/me` | The logged-in user and their groups |
-| GET | `/groups` | List approver groups |
-| POST | `/groups` | Create a group (admin) |
-| PUT | `/groups/{id}/members/{user_id}` | Add a user to a group (admin). Adding an existing member is not an error |
-| DELETE | `/groups/{id}/members/{user_id}` | Remove a user from a group (admin) |
-| GET | `/workflows` | List active workflows (admins can add `?include_inactive=true`) |
-| GET | `/workflows/{id}` | A workflow and its steps |
-| POST | `/workflows` | Create a workflow with its ordered steps (admin) |
-| PATCH | `/workflows/{id}` | Rename, edit the description, or deactivate (admin) |
-| PUT | `/workflows/{id}/steps` | Replace all steps (admin). Requests already submitted are unaffected |
-| GET | `/requests` | Requests you can see, newest first. Filters: `status`, `workflow_id`, `mine`, `assigned_to_me`. Cursor-paginated |
-| POST | `/requests` | Submit a request. Its first step starts immediately with its deadline |
-| GET | `/requests/{id}` | A request and its steps. Visible to the requester, admins, and approvers on it |
-| GET | `/requests/{id}/history` | The request's audit trail |
-| POST | `/requests/{id}/approve` | Approve the current step (approvers in that step's group). The last approval approves the request |
-| POST | `/requests/{id}/reject` | Reject at the current step. A comment is required |
-| POST | `/requests/{id}/withdraw` | The requester cancels their own pending request |
-
-Every decision body includes the `version` of the request the client last loaded, e.g. `{"version": 3, "comment": "OK"}`. If the request has changed since, the API returns `409` and nothing is applied.
-
-### Listing and pagination
-
-`GET /requests?assigned_to_me=true&limit=20` returns:
-
-```json
-{
-  "items": [{ "id": "…", "title": "New laptop", "status": "pending", "current_step": { "name": "Manager review", "due_at": "…" } }],
-  "next_cursor": "eyJjIjogIjIwMjYtMDktMjNUMTQ6MDU6MDkuMTIzNDU2KzAwOjAwIiwgImkiOiAi…"
-}
-```
-
-Pass `next_cursor` back as `?cursor=` for the next page. It's `null` on the last page.
-
-## SLA escalation worker
-
-`python -m app.worker` (the `worker` service in Compose) checks for overdue steps every `WORKER_POLL_SECONDS`. A step is overdue when it's active and past its `due_at`. For each one, the worker sets `escalated_at` and adds an `escalated` event to the request's history, with how long it was overdue. The worker is the "actor", so `actor_id` is `null`. Sending emails or chat messages is out of scope; the audit event is where a notifier would hook in.
-
-It's safe to run several copies (`docker compose up --scale worker=3`). On `SIGTERM` it finishes the current batch and exits.
 
 ## Request lifecycle
 
@@ -122,72 +89,138 @@ stateDiagram-v2
     withdrawn --> [*]
 ```
 
-Who can do what:
+| Action | Who |
+| --- | --- |
+| Approve or reject | Members of the **current** step's approver group, except the requester and anyone who approved an earlier step of the same request. Rejecting requires a comment |
+| Withdraw | The requester only |
+| View a request and its history | The requester, admins, and members of any group with a step on it. Everyone else gets `404` |
 
-- **Approve or reject:** members of the current step's approver group. Being an admin isn't enough.
-- **Separation of duties:** you can't decide on your own request, and one person can't approve two steps of the same request.
-- **Withdraw:** only the requester.
+## API
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/health` | Liveness: the process is up. Doesn't touch the database |
+| GET | `/health/ready` | Readiness: the database answers. `503` if not |
+| POST | `/auth/register` | Create an account (always a regular user) |
+| POST | `/auth/token` | Log in (OAuth2 password form: email as username) and get a bearer token |
+| GET | `/users/me` | The logged-in user and their groups |
+| GET | `/groups` | List approver groups |
+| POST | `/groups` | Create a group (admin) |
+| PUT / DELETE | `/groups/{id}/members/{user_id}` | Add or remove a member (admin). Adding an existing member is not an error |
+| GET | `/workflows`, `/workflows/{id}` | Active workflows and their steps (admins can add `?include_inactive=true`) |
+| POST | `/workflows` | Create a workflow with ordered steps (admin) |
+| PATCH | `/workflows/{id}` | Rename, edit the description, or deactivate (admin) |
+| PUT | `/workflows/{id}/steps` | Replace all steps (admin). Requests already submitted are unaffected |
+| GET | `/requests` | Requests you can see, newest first. Filters: `status`, `workflow_id`, `mine`, `assigned_to_me`. Paginated with `limit` and `cursor` |
+| POST | `/requests` | Submit a request |
+| GET | `/requests/{id}`, `/requests/{id}/history` | A request with its steps, and its audit trail |
+| POST | `/requests/{id}/approve`, `/reject`, `/withdraw` | Decide on the current step, or withdraw |
+
+Decision bodies carry the `version` of the request the client last loaded, e.g. `{"version": 2, "comment": "Within budget"}`. If the request has changed since, the API returns `409` and applies nothing.
+
+List responses look like `{"items": [...], "next_cursor": "…"}`. Pass `next_cursor` back as `?cursor=` for the next page. It's `null` on the last page.
+
+Errors always have a `detail` field: a message, or a list of field problems for `422` validation errors. The codes are `401` (not logged in), `403` (not allowed), `404` (doesn't exist or not visible to you), `409` (conflicts with the current state) or `422` (invalid input).
 
 ## Data model
 
-| Table | Holds |
-| --- | --- |
-| `users` | Accounts. `is_admin` gates workflow management |
-| `approval_groups`, `group_memberships` | Groups of approvers (e.g. Finance). A user can belong to several |
-| `workflows`, `workflow_steps` | Reusable templates: ordered steps, each with an approver group and an SLA in hours |
-| `approval_requests` | A submitted request, its overall status and a `version` for optimistic locking |
-| `request_steps` | The request's own copy of its workflow's steps, with per-step status, deadline and decision |
-| `audit_events` | Append-only history of everything that happened to a request |
-
-## Managing dependencies
-
-Direct dependencies are listed in `requirements.in` (runtime) and `requirements-dev.in` (tests and tooling). After editing either file, regenerate the pinned lockfiles:
-
-```bash
-pip-compile requirements.in
-pip-compile requirements-dev.in
-pip-sync requirements.txt requirements-dev.txt
+```mermaid
+erDiagram
+    users }o--o{ approval_groups : "group_memberships"
+    workflows ||--|{ workflow_steps : "ordered steps"
+    approval_groups ||--o{ workflow_steps : approves
+    workflows ||--o{ approval_requests : "submitted against"
+    users ||--o{ approval_requests : submits
+    approval_requests ||--|{ request_steps : "copy of the steps"
+    approval_groups ||--o{ request_steps : approves
+    approval_requests ||--o{ audit_events : "append-only history"
 ```
 
-The dev file is constrained by `-c requirements.txt`, so packages shared by both files always resolve to the same version.
+`request_steps` holds each request's own copy of its workflow's steps, with the status, deadline, escalation and decision for each step. `approval_requests.version` is the optimistic-locking counter.
 
-## Design notes
+## Design decisions
 
-- **Separate liveness and readiness checks.** If the database goes down, `/health/ready` fails so traffic can be routed away, but `/health` keeps passing, so an orchestrator doesn't restart API containers that are healthy. Restarting them wouldn't fix the database anyway.
-- **pip-tools over plain `requirements.txt`.** Every transitive dependency is pinned, so local runs, CI and the Docker image install exactly the same versions. The `.in` files stay short and readable.
-- **Non-root container.** The image runs as an unprivileged `appuser`.
-- **Requests copy their workflow's steps.** When a request is submitted, its steps are copied into `request_steps`. Editing a workflow later only affects new requests, never ones already waiting for approval.
-- **Optimistic locking on requests.** Every update to a request includes `WHERE version = <the version that was read>`. If two approvers act on the same request at once, the second update matches no rows and fails, rather than silently overwriting the first decision.
-- **The audit trail is append-only in the database.** A trigger rejects `UPDATE` and `DELETE` on `audit_events`, so the history can't be rewritten even by a bug in the application.
-- **Enums are stored as `VARCHAR` plus `CHECK`, not native Postgres `ENUM`s.** Adding a value then only means changing a constraint in a migration. Changing a native `ENUM` type is more awkward.
-- **Partial indexes for the hot queries.** The SLA worker's "overdue and not yet escalated" lookup and the "assigned to my groups" lookup each have an index covering only active steps, so these indexes stay small as finished requests pile up.
-- **Migrations run as a separate step,** not on API startup, so several API instances never race to migrate the same database.
-- **Migration tests.** CI upgrades and downgrades the schema twice, then runs `alembic check` to fail the build if a model changed without a matching migration.
+### Consistency and concurrency
 
-- **Short-lived JWTs, but the user is still loaded on every request.** The token proves who you are, but whether you're active, an admin, or in a group is read fresh from the database each time. Deactivating someone or removing them from a group takes effect immediately, instead of when their token expires. It costs one indexed lookup per request. A stateless check (trusting what's in the token) would scale further, but would need a revocation list.
-- **The JWT algorithm is pinned on decode.** The server never lets the token's own header choose the algorithm, which blocks the classic `alg: none` attack (there's a test for it).
-- **Login doesn't reveal which emails exist.** A wrong password and an unknown email get the same response, and an unknown email still runs a password-hash check, so response time doesn't give it away either.
-- **Password hashes upgrade themselves.** On login, a hash made with older Argon2 settings is replaced with one using the current settings.
-- **Duplicate emails are caught by the database's unique constraint,** not by checking first. A "check, then insert" approach can let two simultaneous registrations for the same email both through.
-- **The dev JWT secret refuses to run in production.** If `APP_ENV` isn't `development` and `JWT_SECRET` still has the placeholder value published in this repo, the app won't start.
+- **Optimistic locking rather than row locks.** Approvals are infrequent and conflicts are rarer, so holding `SELECT … FOR UPDATE` locks would add overhead for no benefit. Each decision is checked twice:
+  1. The client sends the `version` it saw. If it's out of date, the API returns 409.
+  2. The write itself is `UPDATE … WHERE version = <the version that was loaded>`. That catches two approvers who both passed the first check at the same instant.
+- **Every decision touches the request row,** even when only a step changes. Otherwise approving a middle step would never update `approval_requests`, and the version check would never fire.
+- **One transaction per state change.** The step change, the request status and the audit event commit together, or not at all.
+- **Requests copy their workflow's steps** when they're submitted. Editing a workflow only affects future requests, never ones already in progress.
+- **The audit trail is append-only in the database,** enforced by a trigger. Workflows are deactivated rather than deleted, so history never points at something that's gone.
 
-- **The service layer doesn't know about HTTP.** Services raise domain errors (`NotFound`, `Conflict`, `InvalidInput`), and one exception handler turns them into status codes. The same logic can be called from routes, the CLI and the background worker.
-- **404 instead of 403 for requests you can't see.** Someone outside a request can't tell whether its id exists.
-- **Workflows are deactivated, not deleted.** Past requests still point to them, and the audit trail should never lose what a request was submitted against.
-- **Server-generated columns come back in the INSERT itself** (`eager_defaults`). With async SQLAlchemy, reading an unloaded `created_at` would need a hidden extra query, which async code can't run implicitly.
+### Background work
 
-- **Optimistic locking, not row locks.** Approvals are rare and conflicts rarer, so instead of holding `SELECT ... FOR UPDATE` locks, each decision is checked twice:
-  1. The client sends the `version` it saw. If the request has changed since, that's a 409.
-  2. On write, the `UPDATE` includes `WHERE version = <the version that was loaded>`. This catches two approvers whose requests both passed the first check at the same moment. A test forces exactly that race with two database sessions.
-- **Every decision rewrites the request row, even when only a step changed.** Otherwise approving a middle step wouldn't touch `approval_requests`, the version wouldn't change, and the lock above would never trigger.
-- **One transaction per decision.** The step change, the request's status and the audit event are committed together. The race test checks that the losing approval leaves no audit event behind.
+- **Postgres as the job queue.** `SKIP LOCKED` lets workers share the work without blocking each other. A test holds one worker's lock open and checks that a second worker immediately takes a different row. Redis with Celery or RQ would add a second system to run and keep in step with the database, which this load doesn't justify.
+- **Exactly-once escalation without a separate jobs table.** A step's `escalated_at` flag and its audit event are committed together, and the worker only claims steps where `escalated_at IS NULL`. If a worker crashes mid-batch, the transaction rolls back and the rows are picked up again. Real notifications would go through an outbox table, because an email can't be rolled back.
+- **Escalating a step doesn't change the request's version,** so an approver who is part-way through a decision isn't hit with a 409.
+- **The partial index needs a literal.** The overdue query writes `status = 'active'` directly into the SQL instead of passing it as a bound parameter. Postgres can only match the partial index `WHERE status = 'active' AND escalated_at IS NULL` when it can see the value while planning the query.
 
-- **Cursor pagination, not `OFFSET`.** Each cursor encodes the `(created_at, id)` of the last row on the page, and the next page continues with `WHERE (created_at, id) < (…)`. Every page is an index range scan, however deep you go. Rows inserted while someone is paging can't push an item onto two pages, and a test checks this. The tradeoff is no "jump to page 7", which a work queue doesn't need. `id` breaks ties between rows created at the same instant.
-- **"Assigned to me" uses the same rules as approving.** The filter excludes your own requests and ones where you already approved an earlier step, so the list only shows requests where you'll actually be allowed to decide.
-- **Visibility is enforced in SQL for lists.** The same rule as viewing a single request is written as `EXISTS` subqueries, so filtering and pagination happen in the database, not by filtering results in Python.
+### Security
 
-- **Postgres is the job queue.** The worker claims overdue steps with `SELECT … FOR UPDATE SKIP LOCKED`. Parallel workers each skip rows another worker has locked, so there's no double escalation and no waiting on each other. A test holds one worker's lock open and checks that a second worker takes the other row straight away. Redis with Celery or RQ would add a second system to run and keep in step with the database, which this load doesn't justify.
-- **Exactly-once escalation without a separate job table.** Setting `escalated_at` and writing the audit event happen in one transaction, and the worker only claims steps where `escalated_at IS NULL`. If a worker crashes mid-batch, the transaction rolls back and another worker picks the rows up. When real notifications are added they'd go through an outbox table, since an email can't be rolled back.
-- **The partial index needs a literal.** The overdue query inlines `status = 'active'` instead of sending it as a bound parameter. Postgres only uses the partial index `WHERE status = 'active' AND escalated_at IS NULL` when it can see the literal value while planning the query.
-- **Escalation doesn't change the request's version.** It only flags the step, so an approver who is mid-decision doesn't get a 409 because the worker happened to run.
-- **The backlog drains without waiting.** When a batch comes back full, the worker goes again immediately and only sleeps once it's caught up. A failing batch is logged and retried on the next tick rather than crashing the process.
+- **The user is loaded on every request,** not trusted from the token. Deactivating someone or changing their groups takes effect immediately. The cost is one indexed lookup per request. A stateless design would need a token revocation list instead.
+- **The JWT algorithm is fixed on the server.** The token's own header can't choose it, which blocks the classic `alg: none` attack, and a test covers it. Secrets shorter than 32 characters are rejected, and the placeholder development secret refuses to start outside `APP_ENV=development`.
+- **Login doesn't reveal which emails are registered.** A wrong password and an unknown email get the same response, and an unknown email still runs a password-hash check, so the timing is the same too.
+- **Argon2id password hashes,** re-hashed automatically on login when the hashing parameters change.
+- **`404`, not `403`, for requests you can't see,** so request ids can't be probed.
+
+### API and data
+
+- **Cursor (keyset) pagination.** Each page is an index range scan however deep you page, and new rows can't push an item onto two pages. The tradeoff is no "jump to page N", which a work queue doesn't need.
+- **`assigned_to_me` applies the same rules as approving,** so the queue never shows a request the user would be refused on.
+- **The service layer knows nothing about HTTP.** Services raise `NotFound`, `Conflict`, `Forbidden` or `InvalidInput`, and a single handler maps them to status codes. The API, the CLI and the worker all reuse the same logic.
+- **Uniqueness is enforced by the database,** for emails, group names and workflow names, rather than by checking first. Checking and then inserting can let two simultaneous requests both through.
+- **Enums are stored as `VARCHAR` with a `CHECK` constraint** rather than native Postgres `ENUM` types, which are awkward to change in migrations. **Partial indexes** cover only active steps, so they stay small as finished requests pile up.
+- **SQLAlchemy relationships use `lazy="raise"`,** so a forgotten eager load fails loudly in tests instead of becoming an accidental query. **`eager_defaults`** reads server-generated columns back as part of the `INSERT`.
+
+### Operations
+
+- **Migrations run as a separate one-shot step,** so API replicas never race each other to migrate.
+- **Separate liveness and readiness checks.** A database outage marks the API "not ready" without making the orchestrator restart healthy containers.
+- **Pinned dependencies with pip-tools,** a non-root container image, and settings read only from environment variables.
+
+## Testing
+
+```bash
+docker compose up -d db        # tests use a separate approvals_test database
+pytest
+ruff check . && ruff format --check .
+```
+
+- **Unit tests,** no database needed: security (token forgery and expiry, secret rules), pagination cursors, and the worker's recovery from a failed batch.
+- **Database tests** against Postgres, emptied before each test:
+  - every endpoint's success and error cases
+  - the permission rules
+  - the two-session approval race
+  - `SKIP LOCKED` with two workers
+  - the audit-log trigger
+  - the migrations, which are upgraded, downgraded, upgraded again, then compared with the models by `alembic check`
+- **Locally,** the database tests are skipped if Postgres isn't running. **In CI** (GitHub Actions, with a Postgres service), `REQUIRE_DATABASE=1` makes them fail instead, so a green build means they really ran.
+
+## Local development without Docker
+
+This needs Python 3.12 and a reachable PostgreSQL.
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+source .venv/bin/activate       # macOS / Linux
+pip install pip-tools
+pip-sync requirements.txt requirements-dev.txt
+cp .env.example .env            # then point DATABASE_URL at your database
+alembic upgrade head
+uvicorn app.main:app --reload   # API
+python -m app.worker            # worker, in a second terminal
+```
+
+Dependencies: edit `requirements.in` or `requirements-dev.in`, then run `pip-compile` on it and `pip-sync requirements.txt requirements-dev.txt`. New migrations: `alembic revision --autogenerate --rev-id 0003 -m "describe the change"`.
+
+## Limitations and what I'd do next
+
+These are deliberately out of scope for now:
+
+- **Notifications.** Escalations are recorded in the audit trail but nobody is notified. The next step would be an outbox table plus a sender.
+- **Linear workflows only.** No parallel steps ("Legal **and** Finance"), no conditional routing ("Finance only above $5,000"), and no delegation while an approver is away.
+- **Auth.** No refresh tokens, no login rate limiting or lockout, and no SSO. An organisation would put this behind its identity provider.
+- **Admin listings are unpaginated.** `/groups` and `/workflows` are small reference lists. Users can't be listed through the API yet.
