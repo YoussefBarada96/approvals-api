@@ -4,6 +4,8 @@
 #
 #    pip-compile --no-index --strip-extras requirements.in
 #
+alembic==1.20.0
+    # via -r requirements.in
 annotated-doc==0.0.5
     # via fastapi
 annotated-types==0.8.0
@@ -22,6 +24,10 @@ h11==0.16.0
     # via uvicorn
 idna==3.20
     # via anyio
+mako==1.4.3
+    # via alembic
+markupsafe==3.0.3
+    # via mako
 pydantic==2.13.5
     # via
     #   fastapi
@@ -33,11 +39,14 @@ pydantic-settings==2.15.0
 python-dotenv==1.2.3
     # via pydantic-settings
 sqlalchemy==2.0.54
-    # via -r requirements.in
+    # via
+    #   -r requirements.in
+    #   alembic
 starlette==1.7.0
     # via fastapi
 typing-extensions==4.16.0
     # via
+    #   alembic
     #   anyio
     #   fastapi
     #   pydantic
