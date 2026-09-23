@@ -139,3 +139,47 @@ def admin_headers(client: TestClient, make_user: Callable) -> dict[str, str]:
 def user_headers(client: TestClient, make_user: Callable) -> dict[str, str]:
     make_user("user@example.com")
     return login(client, "user@example.com")
+
+
+def create_group(client: TestClient, admin_headers: dict[str, str], name: str) -> str:
+    response = client.post("/groups", json={"name": name}, headers=admin_headers)
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+def add_member(client: TestClient, admin_headers: dict[str, str], group_id: str, user_id) -> None:
+    response = client.put(f"/groups/{group_id}/members/{user_id}", headers=admin_headers)
+    assert response.status_code == 204, response.text
+
+
+@pytest.fixture
+def purchase_workflow(client: TestClient, admin_headers: dict[str, str], make_user) -> dict:
+    """Two groups, an approver in each, and a two-step workflow:
+    Manager review (24h) -> Finance review (48h)."""
+    managers = create_group(client, admin_headers, "Managers")
+    finance = create_group(client, admin_headers, "Finance")
+    manager_id = make_user("manager@example.com", full_name="Mo Manager")
+    finance_id = make_user("finance@example.com", full_name="Fay Finance")
+    add_member(client, admin_headers, managers, manager_id)
+    add_member(client, admin_headers, finance, finance_id)
+
+    response = client.post(
+        "/workflows",
+        json={
+            "name": "Purchase order",
+            "description": "Spending over the team budget",
+            "steps": [
+                {"name": "Manager review", "approver_group_id": managers, "sla_hours": 24},
+                {"name": "Finance review", "approver_group_id": finance, "sla_hours": 48},
+            ],
+        },
+        headers=admin_headers,
+    )
+    assert response.status_code == 201, response.text
+    return {
+        "id": response.json()["id"],
+        "managers": managers,
+        "finance": finance,
+        "manager": login(client, "manager@example.com"),
+        "finance_approver": login(client, "finance@example.com"),
+    }

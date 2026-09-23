@@ -10,6 +10,7 @@ class Workflow(UUIDPrimaryKey, CreatedAt, Base):
     """A reusable template: an ordered list of approval steps."""
 
     __tablename__ = "workflows"
+    __mapper_args__ = {"eager_defaults": True}  # see ApprovalRequest
 
     name: Mapped[str] = mapped_column(String(100), unique=True)
     description: Mapped[str] = mapped_column(Text, default="", server_default="")
