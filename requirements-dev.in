@@ -1,0 +1,8 @@
+# Development and CI tools. Constrained to the runtime lockfile so shared
+# packages resolve to the same versions. Regenerate with:
+#   pip-compile requirements-dev.in
+-c requirements.txt
+httpx2
+pip-tools
+pytest
+ruff

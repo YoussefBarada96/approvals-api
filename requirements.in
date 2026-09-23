@@ -1,0 +1,7 @@
+# Runtime dependencies. Edit this file, then regenerate the lockfile with:
+#   pip-compile requirements.in
+fastapi
+uvicorn
+pydantic-settings
+sqlalchemy[asyncio]
+asyncpg
