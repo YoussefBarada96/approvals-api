@@ -2,7 +2,7 @@
 
 A workflow and approval engine built with FastAPI and PostgreSQL. A request (say, a purchase order) moves through an ordered set of approval steps. Each step is assigned to an approver group and has a deadline. Every state change is written to an audit trail, and a background worker escalates steps that miss their deadline.
 
-> **Status:** in progress. The service skeleton, health checks, Docker setup, CI and the database schema are done. Authentication and the approval endpoints are being built next.
+> **Status:** in progress. The service skeleton, database schema, authentication and approver-group management are done. Workflows and the approval endpoints are being built next.
 
 ## Tech stack
 
@@ -10,6 +10,7 @@ A workflow and approval engine built with FastAPI and PostgreSQL. A request (say
 | --- | --- |
 | API | FastAPI (Python 3.12) |
 | Database | PostgreSQL 16, SQLAlchemy 2.0 (async) with asyncpg, Alembic migrations |
+| Auth | OAuth2 password flow issuing JWTs (PyJWT), Argon2 password hashing (pwdlib) |
 | Config | pydantic-settings (environment variables) |
 | Dependencies | pip-tools (`requirements.in` compiled to pinned `requirements.txt`) |
 | Tests / lint | pytest, ruff |
@@ -50,12 +51,29 @@ ruff check . && ruff format --check .
 
 The database tests (migrations, constraints) run against a separate `approvals_test` database, which Compose creates on first start, so `docker compose up db` is enough to run them. Without a reachable database they're skipped locally. CI sets `REQUIRE_DATABASE=1`, so there they fail instead.
 
+### Creating the first admin
+
+Self-registration always creates a regular user, so the first admin is created from the command line:
+
+```bash
+docker compose run --rm api python -m app.cli create-admin --email admin@example.com --name "Ada Admin"
+```
+
+Then open http://localhost:8000/docs, click **Authorize**, and log in with that email and password.
+
 ## Endpoints so far
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | Liveness: the process is running. Doesn't touch the database |
 | GET | `/health/ready` | Readiness: the database answers. Returns 503 if it doesn't |
+| POST | `/auth/register` | Create an account (always a regular user) |
+| POST | `/auth/token` | Log in with email and password (OAuth2 form) and get a bearer token |
+| GET | `/users/me` | The logged-in user and their groups |
+| GET | `/groups` | List approver groups |
+| POST | `/groups` | Create a group (admin) |
+| PUT | `/groups/{id}/members/{user_id}` | Add a user to a group (admin). Adding an existing member is not an error |
+| DELETE | `/groups/{id}/members/{user_id}` | Remove a user from a group (admin) |
 
 ## Data model
 
@@ -93,4 +111,11 @@ The dev file is constrained by `-c requirements.txt`, so packages shared by both
 - **Migrations run as a separate step,** not on API startup, so several API instances never race to migrate the same database.
 - **Migration tests.** CI upgrades and downgrades the schema twice, then runs `alembic check` to fail the build if a model changed without a matching migration.
 
-More decisions (auth, pagination, the job queue) will be added as those parts are built.
+- **Short-lived JWTs, but the user is still loaded on every request.** The token proves who you are, but whether you're active, an admin, or in a group is read fresh from the database each time. Deactivating someone or removing them from a group takes effect immediately, instead of when their token expires. It costs one indexed lookup per request. A stateless check (trusting what's in the token) would scale further, but would need a revocation list.
+- **The JWT algorithm is pinned on decode.** The server never lets the token's own header choose the algorithm, which blocks the classic `alg: none` attack (there's a test for it).
+- **Login doesn't reveal which emails exist.** A wrong password and an unknown email get the same response, and an unknown email still runs a password-hash check, so response time doesn't give it away either.
+- **Password hashes upgrade themselves.** On login, a hash made with older Argon2 settings is replaced with one using the current settings.
+- **Duplicate emails are caught by the database's unique constraint,** not by checking first. A "check, then insert" approach can let two simultaneous registrations for the same email both through.
+- **The dev JWT secret refuses to run in production.** If `APP_ENV` isn't `development` and `JWT_SECRET` still has the placeholder value published in this repo, the app won't start.
+
+More decisions (pagination, the job queue) will be added as those parts are built.
