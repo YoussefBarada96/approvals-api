@@ -8,6 +8,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: approvals
+          POSTGRES_PASSWORD: approvals
+          POSTGRES_DB: approvals_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U approvals -d approvals_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://approvals:approvals@localhost:5432/approvals_test
+      # Database tests fail instead of skipping if Postgres isn't reachable.
+      REQUIRE_DATABASE: "1"
     steps:
       - uses: actions/checkout@v4
 
