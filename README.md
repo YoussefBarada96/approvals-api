@@ -2,7 +2,7 @@
 
 A workflow and approval engine built with FastAPI and PostgreSQL. A request (say, a purchase order) moves through an ordered set of approval steps. Each step is assigned to an approver group and has a deadline. Every state change is written to an audit trail, and a background worker escalates steps that miss their deadline.
 
-> **Status:** in progress. Done so far: the database schema, authentication, approver groups, workflow definitions and request submission. Approving and rejecting requests are being built next.
+> **Status:** in progress. The core approval flow works end to end: submit, approve, reject and withdraw, with an audit trail. Next up: paginated listings and the SLA escalation worker.
 
 ## Tech stack
 
@@ -82,6 +82,31 @@ Then open http://localhost:8000/docs, click **Authorize**, and log in with that 
 | POST | `/requests` | Submit a request. Its first step starts immediately with its deadline |
 | GET | `/requests/{id}` | A request and its steps. Visible to the requester, admins, and approvers on it |
 | GET | `/requests/{id}/history` | The request's audit trail |
+| POST | `/requests/{id}/approve` | Approve the current step (approvers in that step's group). The last approval approves the request |
+| POST | `/requests/{id}/reject` | Reject at the current step. A comment is required |
+| POST | `/requests/{id}/withdraw` | The requester cancels their own pending request |
+
+Every decision body includes the `version` of the request the client last loaded, e.g. `{"version": 3, "comment": "OK"}`. If the request has changed since, the API returns `409` and nothing is applied.
+
+## Request lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: submit (step 1 becomes active)
+    pending --> pending: approve a step that isn't the last (next step becomes active)
+    pending --> approved: approve the last step
+    pending --> rejected: reject (remaining steps cancelled)
+    pending --> withdrawn: withdraw (remaining steps cancelled)
+    approved --> [*]
+    rejected --> [*]
+    withdrawn --> [*]
+```
+
+Who can do what:
+
+- **Approve or reject:** members of the current step's approver group. Being an admin isn't enough.
+- **Separation of duties:** you can't decide on your own request, and one person can't approve two steps of the same request.
+- **Withdraw:** only the requester.
 
 ## Data model
 
@@ -130,5 +155,11 @@ The dev file is constrained by `-c requirements.txt`, so packages shared by both
 - **404 instead of 403 for requests you can't see.** Someone outside a request can't tell whether its id exists.
 - **Workflows are deactivated, not deleted.** Past requests still point to them, and the audit trail should never lose what a request was submitted against.
 - **Server-generated columns come back in the INSERT itself** (`eager_defaults`). With async SQLAlchemy, reading an unloaded `created_at` would need a hidden extra query, which async code can't run implicitly.
+
+- **Optimistic locking, not row locks.** Approvals are rare and conflicts rarer, so instead of holding `SELECT ... FOR UPDATE` locks, each decision is checked twice:
+  1. The client sends the `version` it saw. If the request has changed since, that's a 409.
+  2. On write, the `UPDATE` includes `WHERE version = <the version that was loaded>`. This catches two approvers whose requests both passed the first check at the same moment. A test forces exactly that race with two database sessions.
+- **Every decision rewrites the request row, even when only a step changed.** Otherwise approving a middle step wouldn't touch `approval_requests`, the version wouldn't change, and the lock above would never trigger.
+- **One transaction per decision.** The step change, the request's status and the audit event are committed together. The race test checks that the losing approval leaves no audit event behind.
 
 More decisions (pagination, the job queue) will be added as those parts are built.
