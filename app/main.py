@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.db import engine
-from app.routes import auth, groups, health, users, workflows
+from app.routes import auth, groups, health, requests, users, workflows
 from app.services.errors import DomainError
 
 
@@ -34,3 +34,4 @@ app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(groups.router)
 app.include_router(workflows.router)
+app.include_router(requests.router)

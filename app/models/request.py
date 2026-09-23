@@ -56,7 +56,10 @@ class ApprovalRequest(UUIDPrimaryKey, CreatedAt, Base):
     # UPDATE and bumps it. If two approvers act at once, the second UPDATE
     # matches no rows and raises StaleDataError instead of silently overwriting.
     version: Mapped[int] = mapped_column()
-    __mapper_args__ = {"version_id_col": version}
+    # eager_defaults: read server-generated values (created_at, updated_at)
+    # back with RETURNING, so accessing them later needs no extra query, which
+    # async SQLAlchemy can't do implicitly.
+    __mapper_args__ = {"version_id_col": version, "eager_defaults": True}
 
     steps: Mapped[list["RequestStep"]] = relationship(
         back_populates="request",

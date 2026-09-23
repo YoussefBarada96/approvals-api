@@ -25,6 +25,7 @@ class AuditEvent(Base):
 
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_events_request_id_id", "request_id", "id"),)
+    __mapper_args__ = {"eager_defaults": True}  # see ApprovalRequest
 
     # A sequential id gives a stable ordering even for events in the same millisecond.
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
