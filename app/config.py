@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
 
+    worker_poll_seconds: float = Field(default=30, gt=0)
+    worker_batch_size: int = Field(default=50, ge=1, le=1000)
+
     @model_validator(mode="after")
     def require_real_secret_outside_development(self) -> "Settings":
         # Refuse to start with the well-known dev secret anywhere it could

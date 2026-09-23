@@ -38,5 +38,17 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # Escalates overdue steps. Safe to scale: docker compose up --scale worker=3
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://approvals:approvals@db:5432/approvals
+      WORKER_POLL_SECONDS: "10"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:
