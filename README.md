@@ -1,5 +1,7 @@
 # Approvals API
 
+[![CI](https://github.com/YoussefBarada96/approvals-api/actions/workflows/ci.yml/badge.svg)](https://github.com/YoussefBarada96/approvals-api/actions/workflows/ci.yml)
+
 A workflow and approval engine: a FastAPI service backed by PostgreSQL, with a background worker.
 
 A request, say a purchase order, moves through an ordered series of approval steps. Each step belongs to a group of approvers ("Managers", then "Finance") and has a deadline. Every decision is recorded in an audit trail that can only be added to. A background worker escalates steps that miss their deadline.
